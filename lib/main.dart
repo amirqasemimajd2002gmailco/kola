@@ -1,413 +1,234 @@
+import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' as ui;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:file_picker/file_picker.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
-    home: MangaCleanerApp(),
+    home: MangaCleanerMobileApp(),
   ));
 }
 
-// ساختار هر خط کشیده شده
-class Stroke {
-  final List<Offset> points;
-  final Color color;
-  final double strokeWidth;
-
-  Stroke({
-    required this.points,
-    required this.color,
-    required this.strokeWidth,
-  });
-}
-
-class MangaCleanerApp extends StatefulWidget {
-  const MangaCleanerApp({super.key});
+class MangaCleanerMobileApp extends StatefulWidget {
+  const MangaCleanerMobileApp({super.key});
 
   @override
-  State<MangaCleanerApp> createState() => _MangaCleanerAppState();
+  State<MangaCleanerMobileApp> createState() => _MangaCleanerMobileAppState();
 }
 
-class _MangaCleanerAppState extends State<MangaCleanerApp> {
-  File? _imageFile;
-  img.Image? _rawImage;
-  ui.Image? _displayImage;
+class _MangaCleanerMobileAppState extends State<MangaCleanerMobileApp> {
+  final TextEditingController _urlController = TextEditingController();
+  File? _selectedImage;
+  Uint8List? _cleanedImageBytes;
+  bool _isLoading = false;
+  String _status = '';
 
-  Color _selectedColor = Colors.white;
-  double _brushSize = 25.0;
-  bool _isEyedropper = false;
-  bool _isSaving = false;
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedUrl();
+  }
 
-  final List<Stroke> _strokes = [];
-  List<Offset> _currentPoints = [];
+  // خواندن آخرین لینک کولب ذخیره شده
+  Future<void> _loadSavedUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedUrl = prefs.getString('colab_url') ?? '';
+    setState(() {
+      _urlController.text = savedUrl;
+    });
+  }
 
-  // انتخاب تصویر از ویندوز
+  // انتخاب عکس از گالری گوشی
   Future<void> _pickImage() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['jpg', 'jpeg', 'png', 'webp'],
-    );
-
-    if (result != null && result.files.single.path != null) {
-      final file = File(result.files.single.path!);
-      final bytes = await file.readAsBytes();
-
-      final decodedRaw = img.decodeImage(bytes);
-      final codec = await ui.instantiateImageCodec(bytes);
-      final frame = await codec.getNextFrame();
-
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
+    if (pickedFile != null) {
       setState(() {
-        _imageFile = file;
-        _rawImage = decodedRaw;
-        _displayImage = frame.image;
-        _strokes.clear();
-        _currentPoints.clear();
+        _selectedImage = File(pickedFile.path);
+        _cleanedImageBytes = null;
+        _status = 'عکس انتخاب شد.';
       });
     }
   }
 
-  // نمونه‌برداری رنگ زمینه (قطره‌چکان)
-  void _pickColorAt(Offset localPos, Size renderSize) {
-    if (_rawImage == null) return;
+  // ارسال به گوگل کولب برای پاکسازی هوشمند متن
+  Future<void> _sendToColab() async {
+    final serverUrl = _urlController.text.trim();
+    if (serverUrl.isEmpty || _selectedImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('لطفاً لینک کولب و عکس را انتخاب کنید')),
+      );
+      return;
+    }
 
-    // تبدیل مختصات صفحه نمایش به پیکسل واقعی عکس
-    double scaleX = _rawImage!.width / renderSize.width;
-    double scaleY = _rawImage!.height / renderSize.height;
-
-    int px = (localPos.dx * scaleX).clamp(0, _rawImage!.width - 1).toInt();
-    int py = (localPos.dy * scaleY).clamp(0, _rawImage!.height - 1).toInt();
-
-    final pixel = _rawImage!.getPixel(px, py);
+    // ذخیره آدرس برای دفعات بعد
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('colab_url', serverUrl);
 
     setState(() {
-      _selectedColor = Color.fromARGB(
-        pixel.a.toInt(),
-        pixel.r.toInt(),
-        pixel.g.toInt(),
-        pixel.b.toInt(),
-      );
-      _isEyedropper = false; // بعد از انتخاب رنگ، به حالت قلم برمی‌گردد
+      _isLoading = true;
+      _status = 'در حال ارسال و پاک‌سازی هوشمند در سرور کولب...';
     });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('رنگ زمینه انتخاب شد!'),
-        duration: const Duration(seconds: 1),
-      ),
-    );
+    try {
+      final cleanUrl = serverUrl.endsWith('/') ? serverUrl.substring(0, serverUrl.length - 1) : serverUrl;
+      final uri = Uri.parse('$cleanUrl/api/predict/');
+
+      final request = http.MultipartRequest('POST', uri);
+      request.files.add(await http.MultipartFile.fromPath('data', _selectedImage!.path));
+
+      final streamedResponse = await request.send();
+      final response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode == 200) {
+        final decoded = json.decode(response.body);
+        // دریافت تصویر از نتیجه پاسخ کولب
+        String base64String = decoded['data'][0];
+        if (base64String.contains(',')) {
+          base64String = base64String.split(',').last;
+        }
+        setState(() {
+          _cleanedImageBytes = base64Decode(base64String);
+          _status = 'پاک‌سازی با موفقیت انجام شد!';
+        });
+      } else {
+        setState(() => _status = 'خطا از سرور: کد ${response.statusCode}');
+      }
+    } catch (e) {
+      setState(() => _status = 'خطا در ارتباط با کولب: $e');
+    } finally {
+      setState(() => _isLoading = false);
+    }
   }
 
-  // ذخیره تصویر پاک‌سازی شده به عنوان WebP با کیفیت بالا
-  Future<void> _exportToWebP(Size displaySize) async {
-    if (_rawImage == null || _imageFile == null) return;
-
-    setState(() => _isSaving = true);
+  // تبدیل به فرمت کم‌حجم WebP و ذخیره در حافظه گوشی
+  Future<void> _saveAsWebp() async {
+    if (_cleanedImageBytes == null) return;
 
     try {
-      // کشیدن تغییرات روی یک بوم با ابعاد اصلی عکس
-      final recorder = ui.PictureRecorder();
-      final canvas = Canvas(
-        recorder,
-        Rect.fromLTWH(0, 0, _rawImage!.width.toDouble(), _rawImage!.height.toDouble()),
-      );
+      final decodedImg = img.decodeImage(_cleanedImageBytes!);
+      if (decodedImg == null) return;
 
-      // رسم تصویر اولیه
-      canvas.drawImage(_displayImage!, Offset.zero, Paint());
+      // تبدیل به فرمت WebP با کیفیت عالی
+      final webpData = img.encodeWebP(decodedImg, quality: 85);
 
-      // ضریب تبدیل خطوط کشیده شده به اندازه واقعی عکس
-      double scaleX = _rawImage!.width / displaySize.width;
-      double scaleY = _rawImage!.height / displaySize.height;
-
-      for (var stroke in _strokes) {
-        final paint = Paint()
-          ..color = stroke.color
-          ..strokeCap = StrokeCap.round
-          ..strokeJoin = StrokeJoin.round
-          ..strokeWidth = stroke.strokeWidth * scaleX
-          ..isAntiAlias = true;
-
-        for (int i = 0; i < stroke.points.length - 1; i++) {
-          final p1 = Offset(stroke.points[i].dx * scaleX, stroke.points[i].dy * scaleY);
-          final p2 = Offset(stroke.points[i + 1].dx * scaleX, stroke.points[i + 1].dy * scaleY);
-          canvas.drawLine(p1, p2, paint);
-        }
-      }
-
-      final picture = recorder.endRecording();
-      final finalUiImg = await picture.toImage(_rawImage!.width, _rawImage!.height);
-      final byteData = await finalUiImg.toByteData(format: ui.ImageByteFormat.png);
-      final buffer = byteData!.buffer.asUint8List();
-
-      // تبدیل به WebP با کیفیت عالی
-      final imgToEncode = img.decodePng(buffer)!;
-      final webpBytes = img.encodeWebP(imgToEncode, quality: 85);
-
-      // مسیر ذخیره در Downloads سیستم
-      final dir = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
-      final filename = 'Cleaned_${DateTime.now().millisecondsSinceEpoch}.webp';
-      final savePath = '${dir.path}\\$filename';
-
-      final outFile = File(savePath);
-      await outFile.writeAsBytes(webpBytes);
+      final dir = await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
+      final filename = 'MangaCleaned_${DateTime.now().millisecondsSinceEpoch}.webp';
+      final file = File('${dir.path}/$filename');
+      await file.writeAsBytes(webpData);
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            backgroundColor: Colors.green[700],
-            content: Text('فایل WebP با موفقیت ذخیره شد:\n$savePath'),
-            duration: const Duration(seconds: 4),
+            backgroundColor: Colors.green,
+            content: Text('فایل WebP با موفقیت ذخیره شد:\n${file.path}'),
           ),
         );
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('خطا در ذخیره‌سازی: $e')),
+          SnackBar(content: Text('خطا در ذخیره فایل: $e')),
         );
       }
-    } finally {
-      setState(() => _isSaving = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF1E1E2E),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF181825),
-        title: const Text('Manga Cleaner - تبدیل و پاکسازی سریع به WebP'),
-        actions: [
-          if (_displayImage != null)
-            Padding(
-              padding: const EdgeInsets.only(right: 12.0),
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
-                onPressed: _isSaving
-                    ? null
-                    : () => _exportToWebP(
-                          // اندازه صفحه ویرایشگر
-                          MediaQuery.of(context).size,
-                        ),
-                icon: _isSaving
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                      )
-                    : const Icon(Icons.download, color: Colors.white),
-                label: const Text('خروجی WebP', style: TextStyle(color: Colors.white)),
+        title: const Text('Specter - پاک‌کننده هوشمند مانهوا'),
+        backgroundColor: const Color(0xFF1E1E2E),
+        foregroundColor: Colors.white,
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            // فیلد ورود لینک کولب
+            TextField(
+              controller: _urlController,
+              decoration: InputDecoration(
+                labelText: 'لینک گوگل کولب (https://...gradio.live)',
+                hintText: 'https://xxxx.gradio.live',
+                border: const OutlineInputBorder(),
+                prefixIcon: const Icon(Icons.link),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.clear),
+                  onPressed: () => _urlController.clear(),
+                ),
               ),
             ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // نوار ابزار بالا
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            color: const Color(0xFF252538),
-            child: Row(
-              children: [
-                ElevatedButton.icon(
-                  onPressed: _pickImage,
-                  icon: const Icon(Icons.folder_open),
-                  label: const Text('انتخاب عکس مانهوا'),
-                ),
-                const SizedBox(width: 16),
+            const SizedBox(height: 16),
 
-                // دکمه قطره‌چکان
-                IconButton(
-                  tooltip: 'قطره‌چکان (انتخاب رنگ زمینه با کلیک روی عکس)',
-                  icon: Icon(
-                    Icons.colorize,
-                    color: _isEyedropper ? Colors.amber : Colors.white,
-                  ),
-                  onPressed: _displayImage == null
-                      ? null
-                      : () => setState(() => _isEyedropper = !_isEyedropper),
-                ),
-
-                // نمایش رنگ انتخاب شده
-                Container(
-                  width: 28,
-                  height: 28,
-                  decoration: BoxDecoration(
-                    color: _selectedColor,
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.white38, width: 2),
-                  ),
-                ),
-                const SizedBox(width: 20),
-
-                // تنظیم اندازه قلم
-                const Text('ضخامت قلم:', style: TextStyle(color: Colors.white70)),
-                SizedBox(
-                  width: 140,
-                  child: Slider(
-                    value: _brushSize,
-                    min: 5.0,
-                    max: 80.0,
-                    onChanged: (val) => setState(() => _brushSize = val),
-                  ),
-                ),
-                const Spacer(),
-
-                // دکمه بازگشت (Undo)
-                IconButton(
-                  tooltip: 'بازگشت به حرکت قبل (Undo)',
-                  icon: const Icon(Icons.undo, color: Colors.white),
-                  onPressed: _strokes.isEmpty
-                      ? null
-                      : () => setState(() => _strokes.removeLast()),
-                ),
-                // دکمه پاک کردن کل خطوط
-                IconButton(
-                  tooltip: 'پاک کردن همه تغییرات',
-                  icon: const Icon(Icons.delete_sweep, color: Colors.redAccent),
-                  onPressed: _strokes.isEmpty ? null : () => setState(() => _strokes.clear()),
-                ),
-              ],
+            // دکمه انتخاب عکس
+            ElevatedButton.icon(
+              onPressed: _pickImage,
+              icon: const Icon(Icons.photo_library),
+              label: const Text('انتخاب صفحه مانهوا از گالری'),
+              style: ElevatedButton.styleFrom(
+                minimumSize: const Size.fromHeight(48),
+              ),
             ),
-          ),
+            const SizedBox(height: 12),
 
-          // محوطه رسم و نمایش عکس
-          Expanded(
-            child: Center(
-              child: _displayImage == null
-                  ? const Text(
-                      'برای شروع، یک عکس مانهوا انتخاب کنید',
-                      style: TextStyle(color: Colors.white54, fontSize: 16),
-                    )
-                  : LayoutBuilder(
-                      builder: (context, constraints) {
-                        // حفظ نسبت ابعاد عکس در صفحه
-                        double imgAspect = _displayImage!.width / _displayImage!.height;
-                        double containerAspect = constraints.maxWidth / constraints.maxHeight;
-
-                        double renderW, renderH;
-                        if (containerAspect > imgAspect) {
-                          renderH = constraints.maxHeight;
-                          renderW = renderH * imgAspect;
-                        } else {
-                          renderW = constraints.maxWidth;
-                          renderH = renderW / imgAspect;
-                        }
-
-                        Size renderSize = Size(renderW, renderH);
-
-                        return GestureDetector(
-                          onTapDown: (details) {
-                            if (_isEyedropper) {
-                              _pickColorAt(details.localPosition, renderSize);
-                            }
-                          },
-                          onPanStart: (details) {
-                            if (_isEyedropper) return;
-                            _currentPoints = [details.localPosition];
-                          },
-                          onPanUpdate: (details) {
-                            if (_isEyedropper) return;
-                            setState(() {
-                              _currentPoints.add(details.localPosition);
-                            });
-                          },
-                          onPanEnd: (details) {
-                            if (_isEyedropper) return;
-                            setState(() {
-                              _strokes.add(
-                                Stroke(
-                                  points: List.from(_currentPoints),
-                                  color: _selectedColor,
-                                  strokeWidth: _brushSize,
-                                ),
-                              );
-                              _currentPoints.clear();
-                            });
-                          },
-                          child: SizedBox(
-                            width: renderW,
-                            height: renderH,
-                            child: CustomPaint(
-                              painter: CleanerCanvasPainter(
-                                image: _displayImage!,
-                                strokes: _strokes,
-                                activePoints: _currentPoints,
-                                activeColor: _selectedColor,
-                                activeBrushSize: _brushSize,
-                              ),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
+            // دکمه ارسال به هوش مصنوعی
+            ElevatedButton.icon(
+              onPressed: (_selectedImage != null && !_isLoading) ? _sendToColab : null,
+              icon: const Icon(Icons.auto_fix_high),
+              label: const Text('پاک‌سازی متن با هوش مصنوعی کولب'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.deepPurple,
+                foregroundColor: Colors.white,
+                minimumSize: const Size.fromHeight(48),
+              ),
             ),
-          ),
-        ],
+            const SizedBox(height: 16),
+
+            if (_status.isNotEmpty)
+              Text(_status, style: const TextStyle(fontWeight: FontWeight.bold)),
+
+            if (_isLoading) ...[
+              const SizedBox(height: 20),
+              const CircularProgressIndicator(),
+            ],
+
+            const SizedBox(height: 20),
+
+            // پیش‌نمایش تصویر خروجی
+            if (_cleanedImageBytes != null) ...[
+              const Text('نتیجه پاک‌سازی شده:', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.memory(_cleanedImageBytes!),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: _saveAsWebp,
+                icon: const Icon(Icons.download),
+                label: const Text('ذخیره تصویر به فرمت WebP'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.teal,
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size.fromHeight(48),
+                ),
+              ),
+            ] else if (_selectedImage != null) ...[
+              const Text('تصویر اصلی انتخاب شده:'),
+              const SizedBox(height: 8),
+              Image.file(_selectedImage!, height: 300),
+            ],
+          ],
+        ),
       ),
     );
   }
-}
-
-// نقاش برای رندر زنده روی صفحه مانیتور
-class CleanerCanvasPainter extends CustomPainter {
-  final ui.Image image;
-  final List<Stroke> strokes;
-  final List<Offset> activePoints;
-  final Color activeColor;
-  final double activeBrushSize;
-
-  CleanerCanvasPainter({
-    required this.image,
-    required this.strokes,
-    required this.activePoints,
-    required this.activeColor,
-    required this.activeBrushSize,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    // رسم خود تصویر مانهوا
-    paintImage(
-      canvas: canvas,
-      rect: Rect.fromLTWH(0, 0, size.width, size.height),
-      image: image,
-      fit: BoxFit.fill,
-    );
-
-    // رسم خطوط ذخیره شده قبلی
-    for (var stroke in strokes) {
-      final paint = Paint()
-        ..color = stroke.color
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round
-        ..strokeWidth = stroke.strokeWidth
-        ..isAntiAlias = true;
-
-      for (int i = 0; i < stroke.points.length - 1; i++) {
-        canvas.drawLine(stroke.points[i], stroke.points[i + 1], paint);
-      }
-    }
-
-    // رسم خطی که در همین لحظه موس در حال کشیدن آن است
-    if (activePoints.length > 1) {
-      final activePaint = Paint()
-        ..color = activeColor
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round
-        ..strokeWidth = activeBrushSize
-        ..isAntiAlias = true;
-
-      for (int i = 0; i < activePoints.length - 1; i++) {
-        canvas.drawLine(activePoints[i], activePoints[i + 1], activePaint);
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
